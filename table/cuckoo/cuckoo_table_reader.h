@@ -95,6 +95,11 @@ class CuckooTableReader : public TableReader {
   const Comparator* ucomp_;
   uint64_t (*get_slice_hash_)(const Slice& s, uint32_t index,
                               uint64_t max_num_buckets);
+
+
+    // New method to point to another place in memory
+    bool value_is_handle_;
+    uint64_t buckets_base_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -10,6 +10,7 @@
 #include "table/cuckoo/cuckoo_table_reader.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <utility>
@@ -52,7 +53,11 @@ CuckooTableReader::CuckooTableReader(
       cuckoo_block_bytes_minus_one_(0),
       table_size_(0),
       ucomp_(comparator),
-      get_slice_hash_(get_slice_hash) {
+      get_slice_hash_(get_slice_hash),
+      
+      // New method
+      value_is_handle_(false),
+        buckets_base_(0) {
   if (!ioptions.allow_mmap_reads) {
     status_ = Status::InvalidArgument("File is not mmaped");
     return;
@@ -146,6 +151,27 @@ CuckooTableReader::CuckooTableReader(
   // TODO: rate limit reads of whole cuckoo tables.
   status_ = file_->Read(IOOptions(), 0, static_cast<size_t>(file_size),
                         &file_data_, nullptr, nullptr);
+
+    // Read new data
+  auto value_slice =
+      user_props.find(CuckooTablePropertyNames::kValueIsHandle);
+
+  if (value_slice == user_props.end()) {
+    value_is_handle_ = false;
+  } else {
+    value_is_handle_ =
+        *reinterpret_cast<const bool*>(value_slice->second.data());
+  }
+
+  auto bucket_slice =
+      user_props.find(CuckooTablePropertyNames::kLogSize);
+
+    if (bucket_slice == user_props.end()) {
+        buckets_base_ = 0;
+    } else {
+        buckets_base_ =
+            *reinterpret_cast<const uint64_t*>(bucket_slice->second.data());
+    }
 }
 
 Status CuckooTableReader::Get(const ReadOptions& /*readOptions*/,
@@ -159,7 +185,7 @@ Status CuckooTableReader::Get(const ReadOptions& /*readOptions*/,
         bucket_length_ * CuckooHash(user_key, hash_cnt, use_module_hash_,
                                     table_size_, identity_as_first_hash_,
                                     get_slice_hash_);
-    const char* bucket = &file_data_.data()[offset];
+    const char* bucket = &file_data_.data()[buckets_base_ + offset];
     for (uint32_t block_idx = 0; block_idx < cuckoo_block_size_;
          ++block_idx, bucket += bucket_length_) {
       if (ucomp_->Equal(Slice(unused_key_.data(), user_key.size()),
@@ -169,7 +195,18 @@ Status CuckooTableReader::Get(const ReadOptions& /*readOptions*/,
       // Here, we compare only the user key part as we support only one entry
       // per user key and we don't support snapshot.
       if (ucomp_->Equal(user_key, Slice(bucket, user_key.size()))) {
-        Slice value(bucket + key_length_, value_length_);
+        Slice value;
+        if (!value_is_handle_) {
+            value = Slice(bucket + key_length_, value_length_);
+        } else {
+            const char* p = bucket + key_length_;
+            uint64_t off = DecodeFixed64(p);
+            uint32_t len = DecodeFixed32(p + 8);
+            if (len == 0) return Status::OK();
+            value = Slice(file_data_.data() + off, len);
+        }
+
+
         if (is_last_level_) {
           // Sequence number is not stored at the last level, so we will use
           // kMaxSequenceNumber since it is unknown.  This could cause some
@@ -203,7 +240,7 @@ void CuckooTableReader::Prepare(const Slice& key) {
   // Prefetch the first Cuckoo Block.
   Slice user_key = ExtractUserKey(key);
   uint64_t addr =
-      reinterpret_cast<uint64_t>(file_data_.data()) +
+      reinterpret_cast<uint64_t>(file_data_.data()) + buckets_base_ + 
       bucket_length_ * CuckooHash(user_key, 0, use_module_hash_, table_size_,
                                   identity_as_first_hash_, nullptr);
   uint64_t end_addr = addr + cuckoo_block_bytes_minus_one_;
@@ -235,19 +272,24 @@ class CuckooTableIterator : public InternalIterator {
   struct BucketComparator {
     BucketComparator(const Slice& file_data, const Comparator* ucomp,
                      uint32_t bucket_len, uint32_t user_key_len,
+                     uint64_t buckets_base,
                      const Slice& target = Slice())
         : file_data_(file_data),
           ucomp_(ucomp),
           bucket_len_(bucket_len),
           user_key_len_(user_key_len),
-          target_(target) {}
+          target_(target),
+          buckets_base_ (buckets_base) {}
     bool operator()(const uint32_t first, const uint32_t second) const {
-      const char* first_bucket = (first == kInvalidIndex)
-                                     ? target_.data()
-                                     : &file_data_.data()[first * bucket_len_];
-      const char* second_bucket =
-          (second == kInvalidIndex) ? target_.data()
-                                    : &file_data_.data()[second * bucket_len_];
+    const char* first_bucket =
+        (first == kInvalidIndex)
+            ? target_.data()
+            : &file_data_.data()[buckets_base_ + first * bucket_len_];
+
+    const char* second_bucket =
+        (second == kInvalidIndex)
+            ? target_.data()
+            : &file_data_.data()[buckets_base_ + second * bucket_len_];
       return ucomp_->Compare(Slice(first_bucket, user_key_len_),
                              Slice(second_bucket, user_key_len_)) < 0;
     }
@@ -258,6 +300,7 @@ class CuckooTableIterator : public InternalIterator {
     const uint32_t bucket_len_;
     const uint32_t user_key_len_;
     const Slice target_;
+    const uint64_t buckets_base_;
   };
 
   const BucketComparator bucket_comparator_;
@@ -274,7 +317,7 @@ class CuckooTableIterator : public InternalIterator {
 
 CuckooTableIterator::CuckooTableIterator(CuckooTableReader* reader)
     : bucket_comparator_(reader->file_data_, reader->ucomp_,
-                         reader->bucket_length_, reader->user_key_length_),
+                         reader->bucket_length_, reader->user_key_length_, reader->buckets_base_),
       reader_(reader),
       initialized_(false),
       curr_key_idx_(kInvalidIndex) {
@@ -291,7 +334,7 @@ void CuckooTableIterator::InitIfNeeded() {
       static_cast<size_t>(reader_->GetTableProperties()->num_entries));
   uint64_t num_buckets = reader_->table_size_ + reader_->cuckoo_block_size_ - 1;
   assert(num_buckets < kInvalidIndex);
-  const char* bucket = reader_->file_data_.data();
+  const char* bucket = reader_->file_data_.data() + reader_->buckets_base_;
   for (uint32_t bucket_id = 0; bucket_id < num_buckets; ++bucket_id) {
     if (Slice(bucket, reader_->key_length_) != Slice(reader_->unused_key_)) {
       sorted_bucket_ids_.push_back(bucket_id);
@@ -322,7 +365,7 @@ void CuckooTableIterator::Seek(const Slice& target) {
   InitIfNeeded();
   const BucketComparator seek_comparator(
       reader_->file_data_, reader_->ucomp_, reader_->bucket_length_,
-      reader_->user_key_length_, ExtractUserKey(target));
+      reader_->user_key_length_, reader_->buckets_base_, ExtractUserKey(target));
   auto seek_it =
       std::lower_bound(sorted_bucket_ids_.begin(), sorted_bucket_ids_.end(),
                        kInvalidIndex, seek_comparator);
@@ -347,8 +390,10 @@ void CuckooTableIterator::PrepareKVAtCurrIdx() {
     return;
   }
   uint32_t id = sorted_bucket_ids_[curr_key_idx_];
-  const char* offset =
-      reader_->file_data_.data() + id * reader_->bucket_length_;
+
+  const char* offset = reader_->file_data_.data() + reader_->buckets_base_ +
+                       id * reader_->bucket_length_;
+
   if (reader_->is_last_level_) {
     // Always return internal key.
     curr_key_.SetInternalKey(Slice(offset, reader_->user_key_length_), 0,
@@ -356,7 +401,15 @@ void CuckooTableIterator::PrepareKVAtCurrIdx() {
   } else {
     curr_key_.SetInternalKey(Slice(offset, reader_->key_length_));
   }
-  curr_value_ = Slice(offset + reader_->key_length_, reader_->value_length_);
+
+    if (!reader_->value_is_handle_) {
+        curr_value_ = Slice(offset + reader_->key_length_, reader_->value_length_);
+    } else {
+        const char* p = offset + reader_->key_length_;
+        uint64_t off = DecodeFixed64(p);
+        uint32_t len = DecodeFixed32(p + 8);
+        curr_value_ = (len == 0) ? Slice() : Slice(reader_->file_data_.data() + off, len);
+    }
 }
 
 void CuckooTableIterator::Next() {

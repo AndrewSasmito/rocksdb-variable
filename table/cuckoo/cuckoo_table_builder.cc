@@ -43,6 +43,12 @@ const std::string CuckooTablePropertyNames::kUseModuleHash =
 const std::string CuckooTablePropertyNames::kUserKeyLength =
     "rocksdb.cuckoo.hash.userkeylength";
 
+const std::string CuckooTablePropertyNames::kValueIsHandle =
+    "rocksdb.cuckoo.value.is_handle";
+
+const std::string CuckooTablePropertyNames::kLogSize =
+    "rocksdb.cuckoo.valuelog.size";
+
 // Obtained by running echo rocksdb.table.cuckoo | sha1sum
 const uint64_t kCuckooTableMagicNumber = 0x926789d0c5f17873ull;
 
@@ -75,6 +81,7 @@ CuckooTableBuilder::CuckooTableBuilder(
       get_slice_hash_(get_slice_hash),
       closed_(false) {
   // Data is in a huge block.
+  
   properties_.num_data_blocks = 1;
   properties_.index_size = 0;
   properties_.filter_size = 0;
@@ -122,31 +129,39 @@ void CuckooTableBuilder::Add(const Slice& key, const Slice& value) {
     return;
   }
 
+
+  uint64_t entry_idx = num_entries_;
+    if (value_off_by_entry_.size() <= entry_idx) value_off_by_entry_.resize(entry_idx + 1);
+    if (value_len_by_entry_.size() <= entry_idx) value_len_by_entry_.resize(entry_idx + 1);
+
   if (ikey.type == kTypeValue) {
     if (!has_seen_first_value_) {
       has_seen_first_value_ = true;
-      value_size_ = value.size();
-    }
-    if (value_size_ != value.size()) {
-      status_ = Status::NotSupported("all values have to be the same size");
-      return;
+      value_size_ = kValueHandleSize;
     }
 
+    // Sizes can vary now
+    // if (value_size_ != value.size()) {
+    //   status_ = Status::NotSupported("all values have to be the same size");
+    //   return;
+    // }
+
+    uint64_t off = value_log_.size();
+
+    value_log_.append(value.data(), value.size());
+
+    value_off_by_entry_[entry_idx] = off;
+    value_len_by_entry_[entry_idx] = static_cast<uint32_t>(value.size());
+
     if (is_last_level_file_) {
-      kvs_.append(ikey.user_key.data(), ikey.user_key.size());
+        kvs_.append(ikey.user_key.data(), ikey.user_key.size());
     } else {
-      kvs_.append(key.data(), key.size());
+        kvs_.append(key.data(), key.size());
     }
-    kvs_.append(value.data(), value.size());
+
+    ++num_entries_;
     ++num_values_;
-  } else {
-    if (is_last_level_file_) {
-      deleted_keys_.append(ikey.user_key.data(), ikey.user_key.size());
-    } else {
-      deleted_keys_.append(key.data(), key.size());
-    }
   }
-  ++num_entries_;
 
   // In order to fill the empty buckets in the hash table, we identify a
   // key which is not used so far (unused_user_key). We determine this by
@@ -177,8 +192,8 @@ Slice CuckooTableBuilder::GetKey(uint64_t idx) const {
         &deleted_keys_[static_cast<size_t>((idx - num_values_) * key_size_)],
         static_cast<size_t>(key_size_));
   }
-  return Slice(&kvs_[static_cast<size_t>(idx * (key_size_ + value_size_))],
-               static_cast<size_t>(key_size_));
+  return Slice(&kvs_[static_cast<size_t>(idx * key_size_)],
+             static_cast<size_t>(key_size_));
 }
 
 Slice CuckooTableBuilder::GetUserKey(uint64_t idx) const {
@@ -186,15 +201,12 @@ Slice CuckooTableBuilder::GetUserKey(uint64_t idx) const {
   return is_last_level_file_ ? GetKey(idx) : ExtractUserKey(GetKey(idx));
 }
 
+// No longer gets the value
 Slice CuckooTableBuilder::GetValue(uint64_t idx) const {
-  assert(closed_);
-  if (IsDeletedKey(idx)) {
-    static std::string empty_value(static_cast<unsigned int>(value_size_), 'a');
-    return Slice(empty_value);
-  }
-  return Slice(
-      &kvs_[static_cast<size_t>(idx * (key_size_ + value_size_) + key_size_)],
-      static_cast<size_t>(value_size_));
+    uint64_t offset = value_off_by_entry_[idx];
+    uint32_t len = value_len_by_entry_[idx];
+
+    return Slice(value_log_.data() + offset, len);
 }
 
 Status CuckooTableBuilder::MakeHashTable(std::vector<CuckooBucket>* buckets) {
@@ -264,6 +276,15 @@ Status CuckooTableBuilder::MakeHashTable(std::vector<CuckooBucket>* buckets) {
 Status CuckooTableBuilder::Finish() {
   assert(!closed_);
   closed_ = true;
+
+    const IOOptions opts;
+    uint64_t valuelog_size = value_log_.size();
+    if (!value_log_.empty()) {
+    io_status_ = file_->Append(opts, Slice(value_log_));
+    if (!io_status_.ok()) { status_ = io_status_; return status_; }
+    }
+    uint64_t buckets_base = valuelog_size;  // buckets start after value log
+    
   std::vector<CuckooBucket> buckets;
   std::string unused_bucket;
   if (num_entries_ > 0) {
@@ -303,6 +324,7 @@ Status CuckooTableBuilder::Finish() {
     }
     if (is_last_level_file_) {
       unused_bucket = unused_user_key;
+      unused_bucket.resize(key_size_ + value_size_);
     } else {
       ParsedInternalKey ikey(unused_user_key, 0, kTypeValue);
       AppendInternalKey(&unused_bucket, ikey);
@@ -318,7 +340,7 @@ Status CuckooTableBuilder::Finish() {
   unused_bucket.resize(static_cast<size_t>(bucket_size), 'a');
   // Write the table.
   uint32_t num_added = 0;
-  const IOOptions opts;
+
   for (auto& bucket : buckets) {
     if (bucket.vector_idx == kMaxVectorIdx) {
       io_status_ = file_->Append(opts, Slice(unused_bucket));
@@ -327,7 +349,12 @@ Status CuckooTableBuilder::Finish() {
       io_status_ = file_->Append(opts, GetKey(bucket.vector_idx));
       if (io_status_.ok()) {
         if (value_size_ > 0) {
-          io_status_ = file_->Append(opts, GetValue(bucket.vector_idx));
+            auto idx = bucket.vector_idx;
+            char hbuf[kValueHandleSize];
+            EncodeFixed64(hbuf, value_off_by_entry_[idx]);      // absolute file offset
+            EncodeFixed32(hbuf + 8, value_len_by_entry_[idx]);  // length
+            EncodeFixed32(hbuf + 12, 0);
+            io_status_ = file_->Append(opts, Slice(hbuf, kValueHandleSize));
         }
       }
     }
@@ -340,8 +367,8 @@ Status CuckooTableBuilder::Finish() {
   properties_.raw_key_size = num_added * properties_.fixed_key_len;
   properties_.raw_value_size = num_added * value_size_;
 
-  uint64_t offset = buckets.size() * bucket_size;
-  properties_.data_size = offset;
+    uint64_t offset = buckets_base + buckets.size() * bucket_size;
+    properties_.data_size = buckets.size() * bucket_size;
   unused_bucket.resize(static_cast<size_t>(properties_.fixed_key_len));
   properties_.user_collected_properties[CuckooTablePropertyNames::kEmptyKey] =
       unused_bucket;
@@ -372,6 +399,13 @@ Status CuckooTableBuilder::Finish() {
       .user_collected_properties[CuckooTablePropertyNames::kUserKeyLength]
       .assign(reinterpret_cast<const char*>(&user_key_len),
               sizeof(user_key_len));
+
+    bool is_handle = true;
+    properties_.user_collected_properties[CuckooTablePropertyNames::kValueIsHandle]
+    .assign(reinterpret_cast<const char*>(&is_handle), sizeof(is_handle));
+
+    properties_.user_collected_properties[CuckooTablePropertyNames::kLogSize]
+    .assign(reinterpret_cast<const char*>(&valuelog_size), sizeof(valuelog_size));
 
   // Write meta blocks.
   MetaIndexBuilder meta_index_builder;
@@ -445,7 +479,6 @@ uint64_t CuckooTableBuilder::FileSize() const {
   }
 }
 
-// This method is invoked when there is no place to insert the target key.
 // It searches for a set of elements that can be moved to accommodate target
 // key. The search is a BFS graph traversal with first level (hash_vals)
 // being all the buckets target key could go to.

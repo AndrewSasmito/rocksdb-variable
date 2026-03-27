@@ -129,7 +129,22 @@ class CuckooTableBuilder : public TableBuilder {
   std::string largest_user_key_ = "";
   std::string smallest_user_key_ = "";
 
-  bool closed_;  // Either Finish() or Abandon() has been called.
+  // New method
+    bool closed_;  // Either Finish() or Abandon() has been called.
+
+
+    // Store real values contiguously at the beginning of file
+    std::string value_log_;
+
+    // For each entry index (same index used by vector_idx in buckets):
+    // where its value begins inside value_log_ and how long it is.
+    // For deletions, len=0.
+    std::vector<uint64_t> value_off_by_entry_;
+    std::vector<uint32_t> value_len_by_entry_;
+
+    // If true: value stored as handle in bucket, real bytes in value_log_
+
+    static constexpr uint32_t kValueHandleSize = 16; // Default size
 };
 
 }  // namespace ROCKSDB_NAMESPACE

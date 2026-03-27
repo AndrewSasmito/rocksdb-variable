@@ -1727,6 +1727,9 @@ rocksdb_undump: $(OBJ_DIR)/tools/dump/rocksdb_undump.o $(LIBRARY)
 cuckoo_table_builder_test: $(OBJ_DIR)/table/cuckoo/cuckoo_table_builder_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+cuckoo_table_builder_test_new: $(OBJ_DIR)/table/cuckoo/cuckoo_table_builder_test_new.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 cuckoo_table_reader_test: $(OBJ_DIR)/table/cuckoo/cuckoo_table_reader_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

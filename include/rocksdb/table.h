@@ -881,6 +881,11 @@ struct CuckooTablePropertyNames {
   static const std::string kUseModuleHash;
   // Fixed user key length
   static const std::string kUserKeyLength;
+
+  // New method for new area!
+  static const std::string kValueIsHandle;
+  static const std::string kLogSize;
+
 };
 
 struct CuckooTableOptions {
