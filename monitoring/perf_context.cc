@@ -155,7 +155,12 @@ struct PerfContextByLevelInt {
   defCmd(decrypt_data_nanos)                       \
   defCmd(number_async_seek)                        \
   defCmd(file_ingestion_nanos)                     \
-  defCmd(file_ingestion_blocking_live_writes_nanos)
+  defCmd(file_ingestion_blocking_live_writes_nanos)\
+  defCmd(data_block_read_byte)                     \
+  defCmd(index_block_read_byte)                    \
+  defCmd(filter_block_read_byte)                   \
+  defCmd(compression_dict_block_read_byte)         \
+  defCmd(metadata_block_read_byte)
 // clang-format on
 
 struct PerfContextInt {
@@ -259,10 +264,10 @@ void PerfContext::Reset() {
 #endif
 }
 
-void PerfContextByLevel::Reset(){
+void PerfContextByLevel::Reset() {
 #ifndef NPERF_CONTEXT
 #define EMIT_FIELDS(x) x = 0;
-    DEF_PERF_CONTEXT_LEVEL_METRICS(EMIT_FIELDS)
+  DEF_PERF_CONTEXT_LEVEL_METRICS(EMIT_FIELDS)
 #undef EMIT_FIELDS
 #endif
 }

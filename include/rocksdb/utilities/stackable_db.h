@@ -375,6 +375,8 @@ class StackableDB : public DB {
   void DisableManualCompaction() override {
     return db_->DisableManualCompaction();
   }
+  void AbortAllCompactions() override { return db_->AbortAllCompactions(); }
+  void ResumeAllCompactions() override { return db_->ResumeAllCompactions(); }
 
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override {
@@ -384,11 +386,6 @@ class StackableDB : public DB {
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* column_family) override {
     return db_->NumberLevels(column_family);
-  }
-
-  using DB::MaxMemCompactionLevel;
-  int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) override {
-    return db_->MaxMemCompactionLevel(column_family);
   }
 
   using DB::Level0StopWriteTrigger;

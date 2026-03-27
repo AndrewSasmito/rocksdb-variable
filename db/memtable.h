@@ -65,6 +65,7 @@ struct ImmutableMemTableOptions {
   bool allow_data_in_errors;
   bool paranoid_memory_checks;
   bool memtable_veirfy_per_key_checksum_on_seek;
+  bool memtable_batch_lookup_optimization;
 };
 
 // Batched counters to updated when inserting keys in one write batch.
@@ -328,7 +329,7 @@ class ReadOnlyMemTable {
   // `persist_user_defined_timestamps` to false. The tracked newest UDT will be
   // used by flush job in the background to help check the MemTable's
   // eligibility for Flush.
-  virtual const Slice& GetNewestUDT() const = 0;
+  virtual Slice GetNewestUDT() const = 0;
 
   // Increase reference count.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -599,6 +600,11 @@ class MemTable final : public ReadOnlyMemTable {
                                                 std::memory_order_relaxed);
   }
 
+  // Returns true if a flush has already been scheduled for this memtable
+  bool HasFlushScheduled() const {
+    return flush_state_.load(std::memory_order_relaxed) == FLUSH_SCHEDULED;
+  }
+
   InternalIterator* NewIterator(
       const ReadOptions& read_options,
       UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena,
@@ -820,7 +826,7 @@ class MemTable final : public ReadOnlyMemTable {
 
   //  Gets the newest user defined timestamps in the memtable. This should only
   //  be called when user defined timestamp is enabled.
-  const Slice& GetNewestUDT() const override;
+  Slice GetNewestUDT() const override;
 
   // Returns Corruption status if verification fails.
   static Status VerifyEntryChecksum(const char* entry,
@@ -904,11 +910,11 @@ class MemTable final : public ReadOnlyMemTable {
   // Size in bytes for the user-defined timestamps.
   size_t ts_sz_;
 
-  // Newest user-defined timestamp contained in this MemTable. For ts1, and ts2
-  // if Comparator::CompareTimestamp(ts1, ts2) > 0, ts1 is considered newer than
-  // ts2. We track this field for a MemTable if its column family has UDT
-  // feature enabled.
-  Slice newest_udt_;
+  // Pointer to the newest user-defined timestamp data in this MemTable. The
+  // pointed-to memory lives in the arena and remains valid for the lifetime of
+  // the memtable. Stored as an atomic pointer so that concurrent range
+  // tombstone inserts from the read path can safely update it via CAS.
+  Atomic<const char*> newest_udt_data_{nullptr};
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
